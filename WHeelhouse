@@ -1,0 +1,4 @@
+v ~/offline_wheels/wheelhouse.tgz ./
+git add wheelhouse.tgz
+git commit -m "Add offline wheel bundle"
+git push
