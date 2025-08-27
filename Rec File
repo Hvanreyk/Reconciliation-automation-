@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+import argparse
+import re
+import sys
+import unicodedata
+from pathlib import Path
+import pandas as pd
+
+# ------------- Helpers -------------
+def truthy(x):
+    if isinstance(x, str):
+        return x.strip().lower() in {"1", "true", "t", "yes", "y"}
+    if isinstance(x, (int, float)):
+        try:
+            return int(float(x)) == 1
+        except Exception:
+            return False
+    if isinstance(x, bool):
+        return x
+    return False
+
+def normalize_key(s: str) -> str:
+    """Normalize SF column names like 'Active SGX?' -> 'activesgx' (For matching to mapping 'SF Name')."""
+    s = str(s or "").strip()
+    if s.lower().startswith("active "):
+        s = s[7:]
+    if s.endswith("?"):
+        s = s[:-1]
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r"[^A-Za-z0-9]+", "", s).lower()
+    return s
+
+def display_sf_name(s: str) -> str:
+    """Human display of SF column: strip leading 'Active ' and trailing '?' only."""
+    s = str(s or "").strip()
+    if s.lower().startswith("active "):
+        s = s[7:]
+    if s.endswith("?"):
+        s = s[:-1]
+    return s.strip()
+
+def canonicalize_hub_id(s: str) -> str:
+    """
+    Collapse T2 variants to base:
+      .../EquityIndex-T2-Small-Variable => .../EquityIndex
+      .../Commodity-T2-Small-Variable  => .../Commodity
+      .../FinancialIndex-T2-Small-Variable => .../FinancialIndex
+    """
+    s = str(s or "").strip()
+    s = re.sub(r'(?i)(EquityIndex|Commodity|FinancialIndex)-T2-Small-Variable\b', r'\1', s)
+    return s
+
+def read_all_sheets(path: Path):
+    wb = pd.read_excel(path, sheet_name=None, dtype=object)
+    for name, df in wb.items():
+        df = df.copy()
+        df.columns = [str(c).strip() for c in df.columns]
+        yield name, df
+
+def pick_cols(df: pd.DataFrame, want):
+    """Map normalized desired names to actual df columns."""
+    got = {}
+    for col in df.columns:
+        norm = re.sub(r"[^a-z0-9]+", "", col.lower())
+        for w in want:
+            if norm == re.sub(r"[^a-z0-9]+", "", w.lower()):
+                got[w] = col
+    return got
+
+def is_flag_col(series: pd.Series) -> bool:
+    vals = pd.Series(series).dropna().astype(str).str.strip().str.lower().unique()
+    if len(vals) == 0:
+        return False
+    allowed = {"0", "1", "true", "false", "t", "f", "yes", "no", "y", "n"}
+    return all(v in allowed for v in vals)
+
+# ------------- Core -------------
+def load_entity_to_connections(path: Path):
+    e2t = None
+    for _, df in read_all_sheets(path):
+        cols = pick_cols(df, ["Entity Name", "Connection ID"])
+        if len(cols) == 2:
+            e2t = df[[cols["Entity Name"], cols["Connection ID"]]].dropna().copy()
+            e2t.columns = ["Entity Name", "Connection ID"]
+            break
+    if e2t is None:
+        raise KeyError("Entity_to_Taker.xlsx must contain columns: 'Entity Name' and 'Connection ID'")
+    e2t["Entity Name"] = e2t["Entity Name"].astype(str).str.strip()
+    e2t["Connection ID"] = e2t["Connection ID"].astype(str).str.strip()
+    grp = e2t.groupby("Entity Name")["Connection ID"].apply(lambda s: set(x.upper() for x in s.astype(str)))
+    entity_to_conns = grp.to_dict()
+    all_conns_upper = set(e2t["Connection ID"].str.upper())
+    return entity_to_conns, all_conns_upper
+
+def load_mapping(path: Path):
+    """Require two columns: 'SF Name', 'Hub Identifier' on any sheet. Canonicalize Hub Identifier."""
+    mapping_df = None
+    for _, df in read_all_sheets(path):
+        cols = pick_cols(df, ["SF Name", "Hub Identifier"])
+        if "SF Name" in cols and "Hub Identifier" in cols:
+            mapping_df = df.copy()
+            break
+    if mapping_df is None:
+        raise KeyError("Stream Mapping.xlsx must contain columns: 'SF Name' and 'Hub Identifier'")
+
+    mapping = mapping_df[["SF Name", "Hub Identifier"]].dropna().copy()
+    mapping["Hub Identifier"] = mapping["Hub Identifier"].astype(str).str.strip().map(canonicalize_hub_id)
+    mapping["SF Key"] = mapping["SF Name"].map(normalize_key)
+    mapping["SF Name Display"] = mapping["SF Name"].map(display_sf_name)
+
+    sf_to_hub = mapping.groupby("SF Key")["Hub Identifier"].apply(lambda s: set(s.dropna().astype(str))).to_dict()
+    inv_hub = mapping.groupby("Hub Identifier")["SF Key"].apply(lambda s: set(s.dropna().astype(str))).to_dict()
+    return mapping, sf_to_hub, inv_hub
+
+def load_sf_active(path: Path):
+    """Read SF report: 'Entity Name' + N binary columns (0/1/yes/no/etc). Return rows (Entity, SF Key, SF Name Display)."""
+    sf = None
+    for _, df in read_all_sheets(path):
+        if any(re.sub(r"[^a-z0-9]+", "", c.lower()) == "entityname" for c in df.columns):
+            sf = df.copy()
+            break
+    if sf is None:
+        raise KeyError("SF report must contain 'Entity Name'")
+    sf.columns = [str(c).strip() for c in sf.columns]
+    flag_cols = [c for c in sf.columns if c != "Entity Name" and is_flag_col(sf[c])]
+
+    rows = []
+    for _, row in sf.iterrows():
+        ent = str(row["Entity Name"]).strip()
+        if not ent:
+            continue
+        for c in flag_cols:
+            if truthy(row.get(c)):
+                rows.append({
+                    "Entity Name": ent,
+                    "SF Key": normalize_key(c),
+                    "SF Name Display": display_sf_name(c)
+                })
+    return pd.DataFrame(rows).drop_duplicates()
+
+def load_ts_activity(ts_path: Path, entity_to_conns, all_conns_upper):
+    """From TS: if Valuation Stream is true and taker or stream ID matches any entity connection, record stream activity."""
+    ts = None
+    for _, df in read_all_sheets(ts_path):
+        cols = pick_cols(df, ["Taker Connection ID", "Taker Stream ID", "Valuation Stream"])
+        if len(cols) == 3:
+            ts = df[[cols["Taker Connection ID"], cols["Taker Stream ID"], cols["Valuation Stream"]]].copy()
+            ts.columns = ["Taker Connection ID", "Taker Stream ID", "Valuation Stream"]
+            break
+    if ts is None:
+        raise KeyError("TS file must have: Taker Connection ID, Taker Stream ID, Valuation Stream")
+
+    ts["Valuation Stream"] = ts["Valuation Stream"].apply(truthy)
+    ts = ts[ts["Valuation Stream"] == True].copy()
+    ts["Taker Connection ID"] = ts["Taker Connection ID"].astype(str).str.strip()
+    ts["Taker Stream ID"] = ts["Taker Stream ID"].astype(str).str.strip()
+
+    rows = []
+    for _, r in ts.iterrows():
+        taker = r["Taker Connection ID"].upper()
+        stream_raw = r["Taker Stream ID"]
+        stream_canon = canonicalize_hub_id(stream_raw)
+        ents = set()
+        if taker in all_conns_upper:
+            ents.update({e for e, conns in entity_to_conns.items() if taker in conns})
+        if stream_raw.upper() in all_conns_upper:
+            ents.update({e for e, conns in entity_to_conns.items() if stream_raw.upper() in conns})
+        for ent in ents:
+            rows.append({"Entity Name": ent, "Hub Stream Name": stream_canon})
+    return pd.DataFrame(rows).drop_duplicates()
+
+def load_sd_activity(sd_path: Path, entity_to_conns):
+    """From SD: if Feed to Taker Streams is true and Taker Stream ID matches a connection, record Symbol Group Path activity."""
+    sd = None
+    for _, df in read_all_sheets(sd_path):
+        cols = pick_cols(df, ["Symbol Group Path", "Taker Stream ID", "Feed to Taker Streams"])
+        if len(cols) == 3:
+            sd = df[[cols["Symbol Group Path"], cols["Taker Stream ID"], cols["Feed to Taker Streams"]]].copy()
+            sd.columns = ["Symbol Group Path", "Taker Stream ID", "Feed to Taker Streams"]
+            break
+    if sd is None:
+        raise KeyError("SD file must have: Symbol Group Path, Taker Stream ID, Feed to Taker Streams")
+
+    sd["Feed to Taker Streams"] = sd["Feed to Taker Streams"].apply(truthy)
+    sd = sd[sd["Feed to Taker Streams"] == True].copy()
+    sd["Symbol Group Path"] = sd["Symbol Group Path"].astype(str).str.strip().map(canonicalize_hub_id)
+    sd["Taker Stream ID"] = sd["Taker Stream ID"].astype(str).str.strip()
+
+    rows = []
+    for _, r in sd.iterrows():
+        stream_upper = r["Taker Stream ID"].upper()
+        ents = {e for e, conns in entity_to_conns.items() if stream_upper in conns}
+        for ent in ents:
+            rows.append({"Entity Name": ent, "Hub Stream Name": r["Symbol Group Path"]})
+    return pd.DataFrame(rows).drop_duplicates()
+
+def reconcile(sf_active: pd.DataFrame, sf_to_hub: dict, inv_hub: dict,
+              hub_ts: pd.DataFrame, hub_sd: pd.DataFrame,
+              sf_only_output: bool = False) -> pd.DataFrame:
+    """Produce rows with Status in {Match, SF Only, Hub Only}."""
+    hub_union = pd.concat([hub_ts, hub_sd], ignore_index=True).drop_duplicates()
+    streams_by_entity = {ent: set(g["Hub Stream Name"]) for ent, g in hub_union.groupby("Entity Name")}
+
+    results = []
+
+    # SF-driven rows (Match or SF Only)
+    for entity, rows in sf_active.groupby("Entity Name"):
+        ent_streams = streams_by_entity.get(entity, set())
+        for _, r in rows.iterrows():
+            key = r["SF Key"]
+            sf_disp = r["SF Name Display"]
+            mapped = sf_to_hub.get(key, set())
+            if not mapped:
+                results.append({"Entity Name": entity, "Hub Stream Name": sf_disp, "Status": "SF Only"})
+                continue
+            if mapped & ent_streams:
+                results.append({"Entity Name": entity, "Hub Stream Name": sf_disp, "Status": "Match"})
+            else:
+                results.append({"Entity Name": entity, "Hub Stream Name": sf_disp, "Status": "SF Only"})
+
+    # Hub-driven rows (Hub Only), unless suppressed
+    if not sf_only_output:
+        for entity, ent_streams in streams_by_entity.items():
+            active_keys = set(sf_active[sf_active["Entity Name"] == entity]["SF Key"])
+            for hub_id in ent_streams:
+                mapped_keys = inv_hub.get(hub_id, set())
+                if not (mapped_keys & active_keys):
+                    results.append({"Entity Name": entity, "Hub Stream Name": hub_id, "Status": "Hub Only"})
+
+    out = pd.DataFrame(results).drop_duplicates().sort_values(["Entity Name", "Status", "Hub Stream Name"]).reset_index(drop=True)
+    return out[["Entity Name", "Hub Stream Name", "Status"]]
+
+# ------------- CLI -------------
+def main():
+    p = argparse.ArgumentParser(description="SF vs Hub reconciliation")
+    p.add_argument("--sf", required=True, type=Path, help="Market Data SF Report.xlsx")
+    p.add_argument("--entity_to_taker", required=True, type=Path, help="Entity_to_Taker.xlsx")
+    p.add_argument("--ts", required=True, type=Path, help="Taker Stream Consolidated1.xlsx")
+    p.add_argument("--sd", required=True, type=Path, help="Settings Default Consolidated gpt.xlsx")
+    p.add_argument("--mapping", required=True, type=Path, help="Stream Mapping.xlsx")
+    p.add_argument("--output", required=True, type=Path, help="Output .xlsx")
+    p.add_argument("--sf_only_output", action="store_true", help="If set, suppress Hub Only rows")
+    args = p.parse_args()
+
+    # Load inputs
+    entity_to_conns, all_conns_upper = load_entity_to_connections(args.entity_to_taker)
+    mapping, sf_to_hub, inv_hub = load_mapping(args.mapping)
+    sf_active = load_sf_active(args.sf)
+    hub_ts = load_ts_activity(args.ts, entity_to_conns, all_conns_upper)
+    hub_sd = load_sd_activity(args.sd, entity_to_conns)
+
+    # Reconcile
+    results = reconcile(sf_active, sf_to_hub, inv_hub, hub_ts, hub_sd, sf_only_output=args.sf_only_output)
+
+    # Save
+    with pd.ExcelWriter(args.output, engine="xlsxwriter") as writer:
+        results.to_excel(writer, index=False, sheet_name="Results")
+
+    print(f"Done. Wrote {len(results)} rows to {args.output}")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
