@@ -1,0 +1,24 @@
+Quick notes so you can run it cleanly:
+
+* **Requires:** Python 3.9+ and these pip packages: `pandas`, `openpyxl` (read .xlsx), `xlsxwriter` (write .xlsx).
+* **Inputs expected:**
+
+  * `SF_Patterns.xlsx` — must have at least: **SF Key**, **Path String**, **Match Mode** (`PREFIX` or `EXACT`). Optional: **SF Column**, **SF Display**, **Enabled**.
+  * `Market Data SF Report.xlsx` — contains **Entity Name** + boolean SF columns (e.g., “Active ICE?”).
+  * `Entity_to_Taker.xlsx` — **Entity Name**, **Connection ID**.
+  * `Taker Stream Consolidated1.xlsx` — **Taker Connection ID**, **Taker Stream ID**, **Valuation Stream**.
+  * `Settings Default Consolidated gpt.xlsx` — **Symbol Group Path**, **Taker Stream ID**, **Feed to Taker Streams**.
+* **Run example:**
+
+  ```
+  python reconcile.py \
+    --sf_patterns "SF_Patterns.xlsx" \
+    --sf_report "Market Data SF Report.xlsx" \
+    --entity_to_taker "Entity_to_Taker.xlsx" \
+    --ts "Taker Stream Consolidated1.xlsx" \
+    --sd "Settings Default Consolidated gpt.xlsx" \
+    --output "reconciliation_sf_patterns_results.xlsx"
+  ```
+* **Output sheets:** Results (Entity Name, **SF Display**, Status), Key→Display, Unclassified Observed, Overlapping Patterns (if any), Unknown SF Columns (if any), Observed (Entity x Key).
+
+That’s it. If you want a tiny `.bat`/`.sh` “one-click” wrapper later, say the word and I’ll draft it.
